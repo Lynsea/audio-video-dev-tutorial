@@ -5,6 +5,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
+#include <libavutil/imgutils.h>
 }
 
 #define ERROR_BUF(ret) \
@@ -15,20 +16,17 @@ FFmpegs::FFmpegs() {
 
 }
 
-// 检查采样格式
-static int check_sample_fmt(const AVCodec *codec,
-                            enum AVSampleFormat sample_fmt) {
-    const enum AVSampleFormat *p = codec->sample_fmts;
-
-    while (*p != AV_SAMPLE_FMT_NONE) {
-//        qDebug() << av_get_sample_fmt_name(*p);
-        if (*p == sample_fmt) return 1;
+// 检查像素格式
+static int check_pix_fmt(const AVCodec *codec,
+                         enum AVPixelFormat pixFmt) {
+    const enum AVPixelFormat *p = codec->pix_fmts;
+    while (*p != AV_PIX_FMT_NONE) {
+        if (*p == pixFmt) return 1;
         p++;
     }
     return 0;
 }
 
-// 音频编码
 // 返回负数：中途出现了错误
 // 返回0：编码操作正常完成
 static int encode(AVCodecContext *ctx,
@@ -44,7 +42,6 @@ static int encode(AVCodecContext *ctx,
     }
 
     // 不断从编码器中取出编码后的数据
-    // while (ret >= 0)
     while (true) {
         ret = avcodec_receive_packet(ctx, pkt);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
@@ -63,11 +60,14 @@ static int encode(AVCodecContext *ctx,
     }
 }
 
-void FFmpegs::aacEncode(AudioEncodeSpec &in,
-                        const char *outFilename) {
+void FFmpegs::h264Encode(VideoEncodeSpec &in,
+                         const char *outFilename) {
     // 文件
     QFile inFile(in.filename);
     QFile outFile(outFilename);
+
+    // 一帧图片的大小
+    int imgSize = av_image_get_buffer_size(in.pixFmt, in.width, in.height, 1);
 
     // 返回结果
     int ret = 0;
@@ -78,25 +78,25 @@ void FFmpegs::aacEncode(AudioEncodeSpec &in,
     // 编码上下文
     AVCodecContext *ctx = nullptr;
 
-    // 存放编码前的数据（pcm）
+    // 存放编码前的数据（yuv）
     AVFrame *frame = nullptr;
 
-    // 存放编码后的数据（aac）
+    // 存放编码后的数据（h264）
     AVPacket *pkt = nullptr;
 
+//    uint8_t *buf = nullptr;
+
     // 获取编码器
-//    codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
-    codec = avcodec_find_encoder_by_name("libfdk_aac");
+    codec = avcodec_find_encoder_by_name("libx264");
     if (!codec) {
         qDebug() << "encoder not found";
         return;
     }
 
-    // libfdk_aac对输入数据的要求：采样格式必须是16位整数
     // 检查输入数据的采样格式
-    if (!check_sample_fmt(codec, in.sampleFmt)) {
-        qDebug() << "unsupported sample format"
-                 << av_get_sample_fmt_name(in.sampleFmt);
+    if (!check_pix_fmt(codec, in.pixFmt)) {
+        qDebug() << "unsupported pixel format"
+                 << av_get_pix_fmt_name(in.pixFmt);
         return;
     }
 
@@ -107,19 +107,14 @@ void FFmpegs::aacEncode(AudioEncodeSpec &in,
         return;
     }
 
-    // 设置PCM参数
-    ctx->sample_rate = in.sampleRate;
-    ctx->sample_fmt = in.sampleFmt;
-    ctx->channel_layout = in.chLayout;
-    // 比特率
-    ctx->bit_rate = 32000;
-    // 规格
-    ctx->profile = FF_PROFILE_AAC_HE_V2;
+    // 设置yuv参数
+    ctx->width = in.width;
+    ctx->height = in.height;
+    ctx->pix_fmt = in.pixFmt;
+    // 设置帧率（1秒钟显示的帧数是in.fps）
+    ctx->time_base = {1, in.fps};
 
     // 打开编码器
-//    AVDictionary *options = nullptr;
-//    av_dict_set(&options, "vbr", "5", 0);
-//    ret = avcodec_open2(ctx, codec, &options);
     ret = avcodec_open2(ctx, codec, nullptr);
     if (ret < 0) {
         ERROR_BUF(ret);
@@ -134,18 +129,39 @@ void FFmpegs::aacEncode(AudioEncodeSpec &in,
         goto end;
     }
 
-    // frame缓冲区中的样本帧数量（由ctx->frame_size决定）
-    frame->nb_samples = ctx->frame_size;
-    frame->format = ctx->sample_fmt;
-    frame->channel_layout = ctx->channel_layout;
+    frame->width = ctx->width;
+    frame->height = ctx->height;
+    frame->format = ctx->pix_fmt;
+    frame->pts = 0;
 
-    // 利用nb_samples、format、channel_layout创建缓冲区
-    ret = av_frame_get_buffer(frame, 0);
+    // 利用width、height、format创建缓冲区
+    ret = av_image_alloc(frame->data, frame->linesize,
+                         in.width, in.height, in.pixFmt, 1);
     if (ret < 0) {
         ERROR_BUF(ret);
         qDebug() << "av_frame_get_buffer error" << errbuf;
         goto end;
     }
+
+    // 创建输入缓冲区（方法2）
+//    buf = (uint8_t *) av_malloc(imgSize);
+//    ret = av_image_fill_arrays(frame->data, frame->linesize,
+//                               buf,
+//                               in.pixFmt, in.width, in.height, 1);
+//    if (ret < 0) {
+//        ERROR_BUF(ret);
+//        qDebug() << "av_image_fill_arrays error" << errbuf;
+//        goto end;
+//    }
+//    qDebug() << buf << frame->data[0];
+
+    // 创建输入缓冲区（方法3）
+//    ret = av_frame_get_buffer(frame, 0);
+//    if (ret < 0) {
+//        ERROR_BUF(ret);
+//        qDebug() << "av_frame_get_buffer error" << errbuf;
+//        goto end;
+//    }
 
     // 创建AVPacket
     pkt = av_packet_alloc();
@@ -166,20 +182,14 @@ void FFmpegs::aacEncode(AudioEncodeSpec &in,
 
     // 读取数据到frame中
     while ((ret = inFile.read((char *) frame->data[0],
-                              frame->linesize[0])) > 0) {
-        // 从文件中读取的数据，不足以填满frame缓冲区
-        if (ret < frame->linesize[0]) {
-            int bytes = av_get_bytes_per_sample((AVSampleFormat) frame->format);
-            int ch = av_get_channel_layout_nb_channels(frame->channel_layout);
-            // 设置真正有效的样本帧数量
-            // 防止编码器编码了一些冗余数据
-            frame->nb_samples = ret / (bytes * ch);
-        }
-
+                              imgSize)) > 0) {
         // 进行编码
         if (encode(ctx, frame, pkt, outFile) < 0) {
             goto end;
         }
+
+        // 设置帧的序号
+        frame->pts++;
     }
 
     // 刷新缓冲区
@@ -190,8 +200,15 @@ end:
     inFile.close();
     outFile.close();
 
+//    av_freep(&buf);
+
     // 释放资源
-    av_frame_free(&frame);
+    if (frame) {
+        av_freep(&frame->data[0]);
+//        av_free(frame->data[0]);
+//        frame->data[0] = nullptr;
+        av_frame_free(&frame);
+    }
     av_packet_free(&pkt);
     avcodec_free_context(&ctx);
 

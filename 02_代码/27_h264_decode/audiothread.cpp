@@ -3,6 +3,10 @@
 #include <QDebug>
 #include "ffmpegs.h"
 
+extern "C" {
+#include <libavutil/imgutils.h>
+}
+
 AudioThread::AudioThread(QObject *parent) : QThread(parent) {
     // 当监听到线程结束时（finished），就调用deleteLater回收内存
     connect(this, &AudioThread::finished,
@@ -21,12 +25,11 @@ AudioThread::~AudioThread() {
 }
 
 void AudioThread::run() {
-    AudioDecodeSpec out;
-    out.filename = "F:/res/out.pcm";
+    VideoDecodeSpec out;
+    out.filename = "F:/res/out.yuv";
 
-    FFmpegs::aacDecode("F:/res/in.aac", out);
+    FFmpegs::h264Decode("F:/res/in.h264", out);
 
-    qDebug() << "采样率：" << out.sampleRate;
-    qDebug() << "采样格式：" << av_get_sample_fmt_name(out.sampleFmt);
-    qDebug() << "声道数：" << av_get_channel_layout_nb_channels(out.chLayout);
+    qDebug() << out.width << out.height
+             << out.fps << av_get_pix_fmt_name(out.pixFmt);
 }

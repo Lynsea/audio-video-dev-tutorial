@@ -5,6 +5,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
+#include <libavutil/imgutils.h>
 }
 
 #define ERROR_BUF(ret) \
@@ -12,13 +13,13 @@ extern "C" {
     av_strerror(ret, errbuf, sizeof (errbuf));
 
 // 输入缓冲区的大小
-#define IN_DATA_SIZE 20480
-// 需要再次读取输入文件数据的阈值
-#define REFILL_THRESH 4096
+#define IN_DATA_SIZE 4096
 
 FFmpegs::FFmpegs() {
 
 }
+
+static int frameIdx = 0;
 
 static int decode(AVCodecContext *ctx,
                   AVPacket *pkt,
@@ -43,26 +44,53 @@ static int decode(AVCodecContext *ctx,
             return ret;
         }
 
-//        for (int i = 0; i < frame->channels; i++) {
-//            frame->data[i];
-//        }
+        qDebug() << "解码出第" << ++frameIdx << "帧";
 
         // 将解码后的数据写入文件
-        outFile.write((char *) frame->data[0], frame->linesize[0]);
+        // 写入Y平面
+        outFile.write((char *) frame->data[0],
+                      frame->linesize[0] * ctx->height);
+        // 写入U平面
+        outFile.write((char *) frame->data[1],
+                      frame->linesize[1] * ctx->height >> 1);
+        // 写入V平面
+        outFile.write((char *) frame->data[2],
+                      frame->linesize[2] * ctx->height >> 1);
+
+//        qDebug() << frame->data[0] << frame->data[1] << frame->data[2];
+
+        /*
+         * frame->data[0] 0xd08c400 0x8c400
+         * frame->data[1] 0xd0d79c0 0xd79c0
+         * frame->data[2] 0xd0ea780 0xea780
+         *
+         * frame->data[1] - frame->data[0] = 308672 = y平面的大小
+         * frame->data[2] - frame->data[1] = 77248 = u平面的大小
+         *
+         * y平面的大小 640x480*1 = 307200
+         * u平面的大小 640x480*0.25 = 76800
+         * v平面的大小 640x480*0.25
+         */
+
+//        // 将解码后的数据写入文件(460800)
+//        int imgSize = av_image_get_buffer_size(ctx->pix_fmt, ctx->width, ctx->height, 1);
+//        // outFile.write((char *) frame->data[0], frame->linesize[0]);
+//        outFile.write((char *) frame->data[0], imgSize);
     }
 }
 
-void FFmpegs::aacDecode(const char *inFilename,
-                        AudioDecodeSpec &out) {
+void FFmpegs::h264Decode(const char *inFilename,
+                         VideoDecodeSpec &out) {
     // 返回结果
     int ret = 0;
 
-    // 用来存放读取的输入文件数据（aac）
+    // 用来存放读取的输入文件数据（h264）
     // 加上AV_INPUT_BUFFER_PADDING_SIZE是为了防止某些优化过的reader一次性读取过多导致越界
     char inDataArray[IN_DATA_SIZE + AV_INPUT_BUFFER_PADDING_SIZE];
     char *inData = inDataArray;
 
-    // 每次从输入文件中读取的长度（aac）
+    // 每次从输入文件中读取的长度（h264）
+    // 输入缓冲区中，剩下的等待进行解码的有效数据长度
     int inLen;
     // 是否已经读取到了输入文件的尾部
     int inEnd = 0;
@@ -78,13 +106,14 @@ void FFmpegs::aacDecode(const char *inFilename,
     // 解析器上下文
     AVCodecParserContext *parserCtx = nullptr;
 
-    // 存放解码前的数据(aac)
+    // 存放解码前的数据(h264)
     AVPacket *pkt = nullptr;
-    // 存放解码后的数据(pcm)
+    // 存放解码后的数据(yuv)
     AVFrame *frame = nullptr;
 
     // 获取解码器
-    codec = avcodec_find_decoder_by_name("libfdk_aac");
+    //    codec = avcodec_find_decoder_by_name("h264");
+    codec = avcodec_find_decoder(AV_CODEC_ID_H264);
     if (!codec) {
         qDebug() << "decoder not found";
         return;
@@ -136,12 +165,20 @@ void FFmpegs::aacDecode(const char *inFilename,
         goto end;
     }
 
-    while ((inLen = inFile.read(inDataArray, IN_DATA_SIZE)) > 0) {
+    // 读取文件数据
+    do {
+        inLen = inFile.read(inDataArray, IN_DATA_SIZE);
+        // 设置是否到了文件尾部
+        inEnd = !inLen;
+
+        // 让inData指向数组的首元素
         inData = inDataArray;
 
-        while (inLen > 0) {
+        // 只要输入缓冲区中还有等待进行解码的数据
+        while (inLen > 0 || inEnd) {
+            // 到了文件尾部（虽然没有读取任何数据，但也要调用av_parser_parse2，修复bug）
+
             // 经过解析器解析
-            // 内部调用的核心逻辑是：ff_aac_ac3_parse
             ret = av_parser_parse2(parserCtx, ctx,
                                    &pkt->data, &pkt->size,
                                    (uint8_t *) inData, inLen,
@@ -158,74 +195,30 @@ void FFmpegs::aacDecode(const char *inFilename,
             // 减去已经解析过的数据大小
             inLen -= ret;
 
+            qDebug() << inEnd << pkt->size << ret;
+
             // 解码
             if (pkt->size > 0 && decode(ctx, pkt, frame, outFile) < 0) {
                 goto end;
             }
+
+            // 如果到了文件尾部
+            if (inEnd) break;
         }
-    }
-
-//    inLen = inFile.read(inData, IN_DATA_SIZE);
-//    while (inLen > 0) {
-//        // 经过解析器解析
-//        // 内部调用的核心逻辑是：ff_aac_ac3_parse
-//        ret = av_parser_parse2(parserCtx, ctx,
-//                               &pkt->data, &pkt->size,
-//                               (uint8_t *) inData, inLen,
-//                               AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
-
-//        /*
-//         pkt->data = inData;
-//         pkt->size = inLen;
-//         */
-////        qDebug() << pkt->data << (uint8_t *) inData;
-////        qDebug() << pkt->size << inLen;
-
-//        if (ret < 0) {
-//            ERROR_BUF(ret);
-//            qDebug() << "av_parser_parse2 error" << errbuf;
-//            goto end;
-//        }
-
-//        // 跳过已经解析过的数据
-//        inData += ret;
-//        // 减去已经解析过的数据大小
-//        inLen -= ret;
-
-//        // 解码
-//        if (pkt->size > 0 && decode(ctx, pkt, frame, outFile) < 0) {
-//            goto end;
-//        }
-
-//        // 检查是否需要读取新的文件数据
-//        if (inLen < REFILL_THRESH && !inEnd) {
-//            // 剩余数据移动到缓冲区的最前面
-//            memmove(inDataArray, inData, inLen);
-
-//            // 重置inData
-//            inData = inDataArray;
-
-//            // 读取文件数据到inData + inLen位置
-//            int len = inFile.read(inData + inLen, IN_DATA_SIZE - inLen);
-//            if (len > 0) { // 有读取到文件数据
-//                inLen += len;
-//            } else { // 文件中已经没有任何数据
-//                // 标记为已经读取到文件的尾部
-//                inEnd = 1;
-//            }
-//        }
-//    }
+    } while (!inEnd);
 
     // 刷新缓冲区
-//    pkt->data = NULL;
-//    pkt->size = 0;
-//    decode(ctx, pkt, frame, outFile);
+    //    pkt->data = nullptr;
+    //    pkt->size = 0;
+    //    decode(ctx, pkt, frame, outFile);
     decode(ctx, nullptr, frame, outFile);
 
     // 赋值输出参数
-    out.sampleRate = ctx->sample_rate;
-    out.sampleFmt = ctx->sample_fmt;
-    out.chLayout = ctx->channel_layout;
+    out.width = ctx->width;
+    out.height = ctx->height;
+    out.pixFmt = ctx->pix_fmt;
+    // 用framerate.num获取帧率，并不是time_base.den
+    out.fps = ctx->framerate.num;
 
 end:
     inFile.close();
@@ -234,4 +227,34 @@ end:
     av_frame_free(&frame);
     av_parser_close(parserCtx);
     avcodec_free_context(&ctx);
+
+// bug fix
+// https://patchwork.ffmpeg.org/project/ffmpeg/patch/tencent_609A2E9F73AB634ED670392DD89A63400008@qq.com/
+
+//
+//    while ((inLen = inFile.read(inDataArray, IN_DATA_SIZE)) > 0)
+//        while (inLen > 0) {
+//            // 经过解析器解析
+//            ret = av_parser_parse2(parserCtx, ctx,
+//                                   &pkt->data, &pkt->size,
+//                                   (uint8_t *) inData, inLen,
+//                                   AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+
+//            if (ret < 0) {
+//                ERROR_BUF(ret);
+//                qDebug() << "av_parser_parse2 error" << errbuf;
+//                goto end;
+//            }
+
+//            // 跳过已经解析过的数据
+//            inData += ret;
+//            // 减去已经解析过的数据大小
+//            inLen -= ret;
+
+//            // 解码
+//            if (pkt->size > 0 && decode(ctx, pkt, frame, outFile) < 0) {
+//                goto end;
+//            }
+//        }
+//    }
 }
